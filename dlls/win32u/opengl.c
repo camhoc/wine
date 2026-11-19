@@ -221,6 +221,11 @@ static const char *parse_version( const char *version, int *major, int *minor )
 {
     const char *ptr = version;
 
+#ifdef WINE_IOS
+    /* Madeira: the winios OpenGL ES driver reports "OpenGL ES major.minor ..." */
+    if (!strncmp( ptr, "OpenGL ES ", 10 )) ptr += 10;
+#endif
+
     *major = atoi( ptr );
     if (*major <= 0) *major = 1;
     while (isdigit( *ptr )) ++ptr;
@@ -311,10 +316,18 @@ static void opengl_context_init( struct opengl_context *context )
     BOOL doublebuffer;
     const char *str;
     size_t len;
+#ifdef WINE_IOS
+    BOOL is_gles = FALSE;
+#endif
 
     if (!(str = (const char *)funcs->p_glGetString( GL_VERSION ))) str = "1.0";
     parse_version( str, &context->attrs.major, &context->attrs.minor );
 
+#ifdef WINE_IOS
+    /* Madeira: OpenGL ES has no profile mask or context flags to query */
+    if (!strncmp( str, "OpenGL ES", 9 )) is_gles = TRUE;
+    else
+#endif
     if (context->attrs.major >= 3)
     {
         if (context->attrs.major > 3 || context->attrs.minor > 1)
@@ -325,6 +338,21 @@ static void opengl_context_init( struct opengl_context *context )
     TRACE( "context %p attrs %s version %s\n", context, debugstr_opengl_context_attrs( &context->attrs ), str );
 
     parse_current_extensions( context->attrs.major, context->extensions );
+#ifdef WINE_IOS
+    if (is_gles)
+    {
+        /* Madeira: in OpenGL ES these two have KHR/EXT-suffixed entry points
+         * that opengl32 has no thunks for; listing them makes loaders set the
+         * extension flag with NULL function pointers. */
+        context->extensions[GL_KHR_debug] = FALSE;
+        context->extensions[GL_EXT_separate_shader_objects] = FALSE;
+        /* A GLES context provides the ES entry points these describe on
+         * desktop GL. SDL reads GL_ARB_ES3_compatibility to decide that WGL
+         * (rather than ANGLE's EGL) can create an OpenGL ES 3 context. */
+        context->extensions[GL_ARB_ES2_compatibility] = TRUE;
+        if (context->attrs.major >= 3) context->extensions[GL_ARB_ES3_compatibility] = TRUE;
+    }
+#endif
 
     if ((client = opengl_client_context_from_client( context->client_context )))
     {
@@ -3077,6 +3105,17 @@ static struct opengl_context *win32u_context_create( HDC hdc, struct opengl_cont
         }
     }
 
+#ifdef WINE_IOS
+    /* Madeira: the winios OpenGL ES driver lists the ES profile extensions and
+     * makes every context an ES one; the profile bit carries nothing more. The
+     * desktop (zink) driver does not list them and the request fails as upstream. */
+    if ((attrs.profile & WGL_CONTEXT_ES2_PROFILE_BIT_EXT) && root_core &&
+        root_core->extensions[WGL_EXT_create_context_es2_profile])
+    {
+        attrs.profile &= ~WGL_CONTEXT_ES2_PROFILE_BIT_EXT;
+        attrs.major = attrs.minor = -1;
+    }
+#endif
     if (attrs.profile & WGL_CONTEXT_ES2_PROFILE_BIT_EXT)
     {
         FIXME( "OpenGL ES contexts are not supported\n" );
