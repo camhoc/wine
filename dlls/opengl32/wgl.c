@@ -3178,11 +3178,6 @@ static GLubyte *filter_extensions( struct opengl_client_context *client, const G
     if (client->extensions[WGL_EXT_swap_control]) reserve += all_extensions[WGL_EXT_swap_control].len + 1;
     for (i = 0; i < count; i++)
     {
-        if (extensions[i] == GL_ARB_ES2_compatibility) has_es2 = TRUE;
-        if (extensions[i] == GL_ARB_ES3_compatibility) has_es3 = TRUE;
-    }
-    for (i = 0; i < count; i++)
-    {
         if (!max_len || !client->extensions[extensions[i]]) continue;
         if (used + all_extensions[extensions[i]].len + 1 + reserve > max_len)
         {
@@ -3192,6 +3187,12 @@ static GLubyte *filter_extensions( struct opengl_client_context *client, const G
             break;
         }
         used += all_extensions[extensions[i]].len + 1;
+    }
+    /* only what survived the cut counts as present */
+    for (i = 0; i < count; i++)
+    {
+        if (extensions[i] == GL_ARB_ES2_compatibility) has_es2 = TRUE;
+        if (extensions[i] == GL_ARB_ES3_compatibility) has_es3 = TRUE;
     }
     /* Madeira: the unix side flags these two for an OpenGL ES host context,
      * whose own extension string does not carry them. */

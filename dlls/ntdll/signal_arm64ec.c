@@ -153,7 +153,10 @@ static inline struct ec_thread_state *ec_state( void )
     CHPE_V2_CPU_AREA_INFO *area = get_arm64ec_cpu_area();
     ULONG_PTR p;
     if (!area) return &ec_state_fallback;
-    p = (ULONG_PTR)area + FIELD_OFFSET( CHPE_V2_CPU_AREA_INFO, EmulatorDataInline ) + sizeof(ARM64EC_NT_CONTEXT);
+    /* Wine 11.22: dispatch_emulation() writes a whole struct xcontext (context,
+     * CONTEXT_EX and XSTATE, 0x670 bytes) at ContextAmd64, so the free bytes
+     * start after that, not after the bare context. */
+    p = (ULONG_PTR)area + FIELD_OFFSET( CHPE_V2_CPU_AREA_INFO, EmulatorDataInline ) + sizeof(struct xcontext);
     p = (p + 15) & ~(ULONG_PTR)15;
     return (struct ec_thread_state *)p;
 }
