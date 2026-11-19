@@ -229,6 +229,10 @@ struct dir_data
     unsigned int            count;   /* count of used entries in the names array */
     unsigned int            pos;     /* current reading position in the names array */
     struct file_identity    id;      /* directory file identity */
+#ifdef WINE_IOS
+    BOOL                    ios_mtime_valid; /* ios_mtime was read with id */
+    struct timespec         ios_mtime;       /* the directory's mtime when it was read */
+#endif
     struct dir_data_names  *names;   /* directory file names */
     struct dir_data_buffer *buffer;  /* head of data buffers list */
     UNICODE_STRING          mask;    /* the mask used when creating the cache entry */
@@ -2980,6 +2984,131 @@ static NTSTATUS get_mountmgr_fs_info( HANDLE handle, int fd, struct mountmgr_uni
  *
  * Return a directory entry from the cached data.
  */
+#ifdef WINE_IOS
+/* iOS-Madeira: a short-lived cache of the stat and attributes of directory entries.
+ *
+ * Every entry a listing returns costs lstat() plus one listxattr() per attribute looked up
+ * (two), a stat() of "<dir>/.." for a directory, and a stat() for a symlink, and in the iOS
+ * sandbox each of those calls is slow. Steam's client service (32-bit SteamService.exe)
+ * prepares a CEG game by listing C:\windows and system32 (syswow64, ~1000 entries) about a
+ * thousand times in a row, on new handles each time; on an iPhone that took longer than the
+ * ~100 s Steam waits for the service, so Black Ops 1 (app 42700) never got its binaries
+ * (RemoteCallFailed, 55). On a PC the same listing takes a second or two.
+ *
+ * An entry is answered from the cache while its directory is the same one (device and inode)
+ * with the same mtime as when the entry was stored, so an entry added, removed or renamed
+ * since misses, and for at most MADEIRA_DIR_INFO_CACHE_MS (default 2000, 0 turns the cache
+ * off), so a file changed in place (size, times, attributes) shows up within that time.
+ * NTFS itself only updates a directory entry's size and times lazily. Called with
+ * dir_mutex held. */
+#define IOS_DIR_INFO_SLOTS 8192
+
+struct ios_dir_info
+{
+    char            *name;        /* entry name, NULL if the slot is free */
+    unsigned int     hash;
+    dev_t            dev;         /* directory identity and mtime */
+    ino_t            dir;
+    struct timespec  dir_mtime;
+    ULONGLONG        stamp;       /* monotonic ms when stored */
+    int              ret;         /* get_file_info() result: 0, or -1 for ENOENT */
+    struct stat      st;
+    ULONG            attributes;
+    ULONG            reparse_tag;
+};
+
+static struct ios_dir_info *ios_dir_info;
+
+static int ios_dir_info_ms(void)
+{
+    static int ms = -1;
+
+    if (ms < 0)
+    {
+        const char *e = getenv( "MADEIRA_DIR_INFO_CACHE_MS" );
+        int v = e ? atoi( e ) : 2000;
+        ms = v < 0 ? 0 : v > 10000 ? 10000 : v;
+    }
+    return ms;
+}
+
+static ULONGLONG ios_dir_info_now(void)
+{
+    struct timespec ts;
+
+    clock_gettime( CLOCK_MONOTONIC, &ts );
+    return (ULONGLONG)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static unsigned int ios_dir_info_hash( const struct dir_data *data, const char *name )
+{
+    unsigned int h = 2166136261u;
+
+    while (*name) h = (h ^ (unsigned char)*name++) * 16777619u;
+    h ^= (unsigned int)data->id.ino * 2654435761u;
+    h ^= (unsigned int)data->id.dev * 40503u;
+    return h;
+}
+
+static int ios_get_dir_entry_info( const struct dir_data *data, const char *name, const char *path,
+                                   struct stat *st, ULONG *attributes, ULONG *reparse_tag )
+{
+    int ms = ios_dir_info_ms(), ret;
+    struct ios_dir_info *e;
+    unsigned int hash;
+    ULONGLONG now;
+
+    if (!ms || !data->ios_mtime_valid) return get_file_info( path, st, attributes, reparse_tag );
+    if (!ios_dir_info && !(ios_dir_info = calloc( IOS_DIR_INFO_SLOTS, sizeof(*ios_dir_info) )))
+        return get_file_info( path, st, attributes, reparse_tag );
+
+    hash = ios_dir_info_hash( data, name );
+    e = &ios_dir_info[hash & (IOS_DIR_INFO_SLOTS - 1)];
+    now = ios_dir_info_now();
+    if (e->name && e->hash == hash && e->dev == data->id.dev && e->dir == data->id.ino &&
+        e->dir_mtime.tv_sec == data->ios_mtime.tv_sec && e->dir_mtime.tv_nsec == data->ios_mtime.tv_nsec &&
+        now - e->stamp < (ULONGLONG)ms && !strcmp( e->name, name ))
+    {
+        if (e->ret == -1)
+        {
+            errno = ENOENT;
+            return -1;
+        }
+        *st = e->st;
+        *attributes = e->attributes;
+        *reparse_tag = e->reparse_tag;
+        return e->ret;
+    }
+
+    ret = get_file_info( path, st, attributes, reparse_tag );
+    if (ret == -1 && errno != ENOENT) return ret;
+
+    if (!e->name || strcmp( e->name, name ))
+    {
+        free( e->name );
+        if (!(e->name = strdup( name ))) return ret;
+    }
+    e->hash = hash;
+    e->dev = data->id.dev;
+    e->dir = data->id.ino;
+    e->dir_mtime = data->ios_mtime;
+    e->stamp = now;
+    e->ret = ret;
+    if (ret != -1)
+    {
+        e->st = *st;
+        e->attributes = *attributes;
+        e->reparse_tag = *reparse_tag;
+    }
+    else errno = ENOENT;
+    return ret;
+}
+
+/* get_dir_data_entry() below reads entry info through the cache */
+#define get_file_info( path, st, attributes, reparse_tag ) \
+    ios_get_dir_entry_info( dir_data, names->unix_name, path, st, attributes, reparse_tag )
+#endif
+
 static NTSTATUS get_dir_data_entry( struct dir_data *dir_data, void *info_ptr, IO_STATUS_BLOCK *io,
                                     ULONG max_length, FILE_INFORMATION_CLASS class,
                                     union file_directory_info **last_info )
@@ -3089,6 +3218,10 @@ static NTSTATUS get_dir_data_entry( struct dir_data *dir_data, void *info_ptr, I
     *last_info = info;
     return name_len > max_length ? STATUS_BUFFER_OVERFLOW : STATUS_SUCCESS;
 }
+
+#ifdef WINE_IOS
+#undef get_file_info
+#endif
 
 #ifdef VFAT_IOCTL_READDIR_BOTH
 
@@ -3341,6 +3474,17 @@ static NTSTATUS init_cached_dir_data( struct dir_data **data_ret, int fd, const 
         fstat( fd, &st );
         data->id.dev = st.st_dev;
         data->id.ino = st.st_ino;
+#ifdef WINE_IOS
+        data->ios_mtime.tv_sec = st.st_mtime;
+#ifdef HAVE_STRUCT_STAT_ST_MTIM
+        data->ios_mtime.tv_nsec = st.st_mtim.tv_nsec;
+#elif defined(HAVE_STRUCT_STAT_ST_MTIMESPEC)
+        data->ios_mtime.tv_nsec = st.st_mtimespec.tv_nsec;
+#else
+        data->ios_mtime.tv_nsec = 0;
+#endif
+        data->ios_mtime_valid = TRUE;
+#endif
     }
 
     TRACE( "mask %s found %u files\n", debugstr_us( mask ), data->count );
@@ -5310,6 +5454,148 @@ static void madeira_pipe_trace( HANDLE handle, const void *buffer, ULONG length 
 }
 #endif
 
+#ifdef WINE_IOS
+/* x64-ntdll-file: x64 programs that read system DLLs from disk get the x64 (arm64ec) file.
+ *
+ * StarCraft's ClientSdk.dll opens C:\windows\system32\ntdll.dll (an anti-hook scheme), reads it into
+ * its own RWX page, finds the Nt* exports and calls them as x64 syscall stubs. In a prefix whose
+ * session is native ARM64, system32\ntdll.dll is the plain aarch64 build, whose exports are ARM64
+ * stubs ("mov x8,#id; ... blr x16"), so FEX ran ARM64 bytes as x86 and the program died with
+ * c0000005. On Windows ARM64 that path is the ARM64X/EC file, whose x64-visible exports are x64
+ * stubs ("mov r10,rcx; mov eax,id; ... syscall; ret"). C:\windows\sysx64 holds the arm64ec build
+ * (see WineProcessBridge.m, farm sysx64 -> arm64ec-windows), so an open (FILE_OPEN) of system32\ntdll.dll
+ * or system32\win32u.dll from an x64/ARM64EC process is answered from sysx64 instead.
+ *
+ * x64-system32-files: the same for every other DLL there. An anti-tamper or launcher check that reads
+ * system32\kernel32.dll (or kernelbase, user32, advapi32, crypt32, ...) from disk and compares it with the
+ * loaded module got the aarch64 file (Machine 0xAA64, ARM64 .text) while the module in memory is the EC build.
+ * Redirected: a single file name directly under \??\C:\windows\system32\ that ends in .dll, .drv or .ocx,
+ * FILE_OPEN, no RootDirectory, opened without write/delete access, from an x64/ARM64EC process, only when the
+ * sysx64 file exists. .exe is left alone on purpose: CreateProcess opens the image through this call, and
+ * a system32 .exe is native ARM64 on Windows ARM, so redirecting it would turn an ARM64 child into an x64 one.
+ * NtQueryAttributesFile / NtQueryFullAttributesFile on the same names answer from the same sysx64 file, so a size
+ * or time comparison agrees with what the open returns. i386 and native aarch64 processes are left alone
+ * (ios_is_arm64ec_cur() is false for them). MADEIRA_X64_NTDLL_FILE=0 turns all of it off.
+ * Logging: [x64-ntdll-file] #n <from> -> <to> once per distinct file (up to 128). */
+extern int ios_is_arm64ec_cur(void);
+
+#define IOS_X64_NAME_MAX 64   /* longest file name (characters) that is redirected */
+#define IOS_X64_BUF_CHARS 96  /* sysx64 prefix (22) + IOS_X64_NAME_MAX + NUL */
+#define IOS_X64_WRITE_ACCESS (FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_WRITE_EA | FILE_WRITE_ATTRIBUTES | \
+                              DELETE | WRITE_DAC | WRITE_OWNER | GENERIC_WRITE | GENERIC_ALL)
+
+static BOOL ios_x64_ntdll_file_enabled(void)
+{
+    static int on = -1;
+    if (on < 0)
+    {
+        const char *e = getenv( "MADEIRA_X64_NTDLL_FILE" );
+        on = !(e && e[0] == '0' && !e[1]);
+    }
+    return on;
+}
+
+static BOOL ios_x64_ntdll_name_match( const WCHAR *w, const char *lit, unsigned int n )
+{
+    unsigned int i;
+    for (i = 0; i < n; i++)
+    {
+        WCHAR c = w[i];
+        if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
+        if (c != (WCHAR)lit[i]) return FALSE;
+    }
+    return TRUE;
+}
+
+/* Fills *out (backed by buf, IOS_X64_BUF_CHARS WCHARs) with the sysx64 name when name is
+ * system32\<file>.dll / .drv / .ocx. The file name keeps the caller's spelling. */
+static BOOL ios_x64_ntdll_redirect( const UNICODE_STRING *name, WCHAR *buf, UNICODE_STRING *out )
+{
+    static const char sys32[] = "\\??\\c:\\windows\\system32\\";
+    static const char sysx64[] = "\\??\\C:\\windows\\sysx64\\";
+    static const char *const exts[] = { ".dll", ".drv", ".ocx" };
+    unsigned int len = name->Length / sizeof(WCHAR), fl, i, k;
+    const WCHAR *file;
+
+    if (len <= sizeof(sys32) - 1 || !ios_x64_ntdll_name_match( name->Buffer, sys32, sizeof(sys32) - 1 )) return FALSE;
+    file = name->Buffer + sizeof(sys32) - 1;
+    fl = len - (sizeof(sys32) - 1);
+    if (fl <= 4 || fl > IOS_X64_NAME_MAX) return FALSE;
+    for (k = 0; k < fl; k++)
+        if (file[k] == '\\' || file[k] == '/' || file[k] == ':' || !file[k]) return FALSE;   /* one component only */
+    for (i = 0; i < ARRAY_SIZE(exts); i++)
+        if (ios_x64_ntdll_name_match( file + fl - 4, exts[i], 4 )) break;
+    if (i == ARRAY_SIZE(exts)) return FALSE;
+    for (k = 0; k < sizeof(sysx64) - 1; k++) buf[k] = sysx64[k];
+    for (k = 0; k < fl; k++) buf[sizeof(sysx64) - 1 + k] = file[k];
+    buf[sizeof(sysx64) - 1 + fl] = 0;
+    out->Buffer = buf;
+    out->Length = (sizeof(sysx64) - 1 + fl) * sizeof(WCHAR);
+    out->MaximumLength = out->Length + sizeof(WCHAR);
+    return TRUE;
+}
+
+/* One log line per distinct redirected file (hash of the lower-cased target and the kind), at most 128. */
+static void ios_x64_ntdll_log( int attr_query, const UNICODE_STRING *from, const UNICODE_STRING *to )
+{
+    static unsigned int seen[128];
+    static int nseen, logged;
+    char fb[112], tb[112];
+    unsigned int h = 2166136261u ^ (unsigned int)attr_query, k, n;
+    int i, cur = __atomic_load_n( &nseen, __ATOMIC_RELAXED );
+
+    n = to->Length / 2;
+    for (k = 0; k < n; k++)
+    {
+        WCHAR c = to->Buffer[k];
+        if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
+        h = (h ^ (unsigned int)c) * 16777619u;
+    }
+    for (i = 0; i < cur && i < 128; i++) if (seen[i] == h) return;
+    if (cur >= 128) return;
+    seen[cur] = h;
+    __atomic_store_n( &nseen, cur + 1, __ATOMIC_RELAXED );
+    n = from->Length / 2;
+    for (k = 0; k < n && k < sizeof(fb) - 1; k++) fb[k] = (char)from->Buffer[k];
+    fb[k] = 0;
+    n = to->Length / 2;
+    for (k = 0; k < n && k < sizeof(tb) - 1; k++) tb[k] = (char)to->Buffer[k];
+    tb[k] = 0;
+    if (attr_query) dprintf( 2, "[x64-ntdll-file] #%d attr %s -> %s\n", ++logged, fb, tb );
+    else dprintf( 2, "[x64-ntdll-file] #%d %s -> %s\n", ++logged, fb, tb );
+}
+
+/* NtQueryAttributesFile / NtQueryFullAttributesFile: names for attr, from the sysx64 file when the
+ * redirect applies and that file exists, otherwise exactly as before. */
+static NTSTATUS ios_x64_attr_names( const OBJECT_ATTRIBUTES *attr, OBJECT_ATTRIBUTES *new_attr,
+                                    UNICODE_STRING *nt_name, char **unix_name )
+{
+    UNICODE_STRING x64_name;
+    WCHAR x64_buf[IOS_X64_BUF_CHARS];
+    NTSTATUS status;
+
+    *unix_name = NULL;
+    nt_name->Buffer = NULL;
+    if (!attr->RootDirectory && attr->ObjectName && ios_x64_ntdll_file_enabled() &&
+        ios_x64_ntdll_redirect( attr->ObjectName, x64_buf, &x64_name ) && ios_is_arm64ec_cur())
+    {
+        new_attr->ObjectName = &x64_name;
+        status = get_nt_and_unix_names( new_attr, nt_name, unix_name, FILE_OPEN, TRUE );
+        new_attr->ObjectName = attr->ObjectName;   /* x64_name is about to go out of scope */
+        if (!status)
+        {
+            ios_x64_ntdll_log( 1, attr->ObjectName, &x64_name );
+            return status;
+        }
+        free( *unix_name );
+        free( nt_name->Buffer );
+        *unix_name = NULL;
+        nt_name->Buffer = NULL;
+    }
+    return get_nt_and_unix_names( new_attr, nt_name, unix_name, FILE_OPEN, TRUE );
+}
+#endif /* WINE_IOS */
+
 /******************************************************************************
  *              NtCreateFile   (NTDLL.@)
  */
@@ -5378,6 +5664,12 @@ NTSTATUS WINAPI NtCreateFile( HANDLE *handle, ACCESS_MASK access, OBJECT_ATTRIBU
     BOOL name_hidden = FALSE;
     BOOL created = FALSE;
     unsigned int status;
+#ifdef WINE_IOS
+    /* function scope: new_attr.ObjectName may point at x64_name until the end of the call */
+    UNICODE_STRING x64_name;
+    WCHAR x64_buf[IOS_X64_BUF_CHARS];
+    BOOL x64_redirected = FALSE;
+#endif
 
     TRACE( "handle=%p access=%08x name=%s objattr=%08x root=%p sec=%p io=%p alloc_size=%p "
            "attr=%08x sharing=%08x disp=%d options=%08x ea=%p.0x%08x\n",
@@ -5396,8 +5688,36 @@ NTSTATUS WINAPI NtCreateFile( HANDLE *handle, ACCESS_MASK access, OBJECT_ATTRIBU
         status = file_id_to_unix_file_name( &new_attr, &unix_name, &nt_name );
         if (!status) new_attr.ObjectName = &nt_name;
     }
-    else status = get_nt_and_unix_names( &new_attr, &nt_name, &unix_name, disposition,
-                                         options & FILE_OPEN_REPARSE_POINT );
+    else
+    {
+#ifdef WINE_IOS
+        if (!attr->RootDirectory && disposition == FILE_OPEN && !(access & IOS_X64_WRITE_ACCESS) &&
+            ios_x64_ntdll_file_enabled() &&
+            ios_x64_ntdll_redirect( attr->ObjectName, x64_buf, &x64_name ) && ios_is_arm64ec_cur())
+        {
+            new_attr.ObjectName = &x64_name;
+            status = get_nt_and_unix_names( &new_attr, &nt_name, &unix_name, disposition,
+                                            options & FILE_OPEN_REPARSE_POINT );
+            if (!status)
+            {
+                x64_redirected = TRUE;
+                ios_x64_ntdll_log( 0, attr->ObjectName, &x64_name );
+            }
+            else
+            {
+                /* no sysx64 copy: fall back to the name the caller gave */
+                free( unix_name );
+                free( nt_name.Buffer );
+                unix_name = NULL;
+                nt_name.Buffer = NULL;
+                new_attr = *attr;
+            }
+        }
+        if (!x64_redirected)
+#endif
+        status = get_nt_and_unix_names( &new_attr, &nt_name, &unix_name, disposition,
+                                        options & FILE_OPEN_REPARSE_POINT );
+    }
 
     if (status == STATUS_BAD_DEVICE_TYPE)
     {
@@ -5697,7 +6017,12 @@ NTSTATUS WINAPI NtQueryFullAttributesFile( const OBJECT_ATTRIBUTES *attr,
     UNICODE_STRING nt_name;
     OBJECT_ATTRIBUTES new_attr = *attr;
 
+#ifdef WINE_IOS
+    status = ios_x64_attr_names( attr, &new_attr, &nt_name, &unix_name );
+    if (!status)
+#else
     if (!(status = get_nt_and_unix_names( &new_attr, &nt_name, &unix_name, FILE_OPEN, TRUE )))
+#endif
     {
         ULONG attributes;
         struct stat st;
@@ -5729,7 +6054,12 @@ NTSTATUS WINAPI NtQueryAttributesFile( const OBJECT_ATTRIBUTES *attr, FILE_BASIC
     UNICODE_STRING nt_name;
     OBJECT_ATTRIBUTES new_attr = *attr;
 
+#ifdef WINE_IOS
+    status = ios_x64_attr_names( attr, &new_attr, &nt_name, &unix_name );
+    if (!status)
+#else
     if (!(status = get_nt_and_unix_names( &new_attr, &nt_name, &unix_name, FILE_OPEN, TRUE )))
+#endif
     {
         ULONG attributes;
         struct stat st;

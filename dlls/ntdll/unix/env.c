@@ -2028,6 +2028,9 @@ void init_startup_info(void)
         return;
     }
 
+#ifdef WINE_IOS
+    madeira_kusd_fill_if_empty();
+#endif
     info = malloc( startup_info_size );
 
     SERVER_START_REQ( get_startup_info )

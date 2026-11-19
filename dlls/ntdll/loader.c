@@ -1342,6 +1342,30 @@ void ios_eager_delay_resolve( const char *when )
 #include "arm64ec_x64_export_iat.c"
 #include "cs_x64_fastpath.c"   /* MADEIRA_CS_X64 / MADEIRA_TLS_X64 */
 
+/* madeira-duo: an EC importer's IAT value for a forwarded export. kernel32's
+ * EnterCriticalSection is NTDLL.RtlEnterCriticalSection, so the name resolves to
+ * ntdll's x64 export thunk, but import_dll redirected it with kernel32's
+ * redirection table, which has no entry for an ntdll address; the fallback then
+ * decodes the thunk's bytes. MADEIRA_CS_X64 rewrites ntdll's critical-section
+ * thunks to `jmp [rip]` to x64 stubs, so every ARM64EC module that imports
+ * Enter/LeaveCriticalSection from kernel32 bound to those stubs and called them
+ * through its exit thunk (dxc4/text3 logs, 4 Nov: ~5,000 round trips a second
+ * from madeira_d3d12 alone). Redirect with the table of the module the address
+ * is in, as a direct import of that module would be; the importer's own table
+ * stays the fallback. The loader_section is held here. */
+static void *arm64ec_redirect_import( HMODULE imp_mod, void *ptr, const IMAGE_ARM64EC_METADATA *imp_metadata )
+{
+    LDR_DATA_TABLE_ENTRY *owner;
+
+    if (ptr && !LdrFindEntryForAddress( ptr, &owner ) && owner->DllBase != imp_mod)
+    {
+        const IMAGE_ARM64EC_METADATA *owner_metadata = arm64ec_get_module_metadata( owner->DllBase );
+
+        if (owner_metadata) return arm64ec_redirect_ptr( owner->DllBase, ptr, owner_metadata );
+    }
+    return arm64ec_redirect_ptr( imp_mod, ptr, imp_metadata );
+}
+
 static BOOL arm64ec_iat_is_exported_x64( HMODULE module, const IMAGE_THUNK_DATA *slot )
 {
     const IMAGE_ARM64EC_METADATA *metadata = arm64ec_get_module_metadata( module );
@@ -1500,9 +1524,9 @@ static BOOL import_dll( WINE_MODREF *wm, const IMAGE_IMPORT_DESCRIPTOR *descr, L
             }
 #ifdef __arm64ec__
             else if (imp_metadata && !arm64ec_iat_is_exported_x64( module, thunk_list ))
-                thunk_list->u1.Function = (ULONG_PTR)arm64ec_redirect_ptr( imp_mod,
-                                                                           (void *)thunk_list->u1.Function,
-                                                                           imp_metadata );
+                thunk_list->u1.Function = (ULONG_PTR)arm64ec_redirect_import( imp_mod,
+                                                                              (void *)thunk_list->u1.Function,
+                                                                              imp_metadata );
 #endif
             TRACE_(imports)("--- Ordinal %s.%d = %p\n", name, ordinal, (void *)thunk_list->u1.Function );
         }
@@ -1526,9 +1550,9 @@ static BOOL import_dll( WINE_MODREF *wm, const IMAGE_IMPORT_DESCRIPTOR *descr, L
             {
                 void *pre = (void *)thunk_list->u1.Function;
 
-                thunk_list->u1.Function = (ULONG_PTR)arm64ec_redirect_ptr( imp_mod,
-                                                                           (void *)thunk_list->u1.Function,
-                                                                           imp_metadata );
+                thunk_list->u1.Function = (ULONG_PTR)arm64ec_redirect_import( imp_mod,
+                                                                              (void *)thunk_list->u1.Function,
+                                                                              imp_metadata );
                 /* iOS-Madeira ml230: does the EC->EC import bind actually land on native
                  * code, and is that code MARKED EC?
                  *
@@ -5396,6 +5420,112 @@ static void open_known_dll_ntdir(void)
 
 #ifdef __arm64ec__
 
+/* iOS-Madeira [ldr-order] (env MADEIRA_LDR_WINDOWS_ORDER = 1; default off, set in
+ * a game's own file): THE PEB'S MODULE LISTS IN WINDOWS ORDER.
+ *
+ * In an ARM64EC process the emulator (xtajit64.dll) and its dependency tree load
+ * and initialize before kernel32 is loaded and before ntdll's own attach, so the
+ * lists read
+ *   InLoadOrder/InMemoryOrder: exe, ntdll, xtajit64, ucrtbase, kernel32, kernelbase
+ *   InInitializationOrder:     kernelbase, kernel32, ucrtbase, xtajit64, ..., ntdll
+ * where Windows (and x86_64 Wine) has exe, ntdll, kernel32, kernelbase and ntdll,
+ * kernelbase, kernel32. Code that finds a system DLL by its place in a list
+ * instead of by name then searches the wrong one: Call of Duty Black Ops III
+ * (2026-10-18) walked all 1426 export names of kernelbase -- the first module
+ * initialized -- for an ntdll routine, called the NULL it got back and ended
+ * with an exec AV at 0 seven seconds after start.
+ *
+ * With the switch, ntdll heads InInitializationOrderModuleList before the
+ * emulator attaches (process_attach does not insert a module twice), and once
+ * kernel32 is loaded every module but the exe, ntdll, kernel32 and kernelbase
+ * moves, in its current order, to the end of the load- and memory-order lists.
+ * Lookups by name or base do not depend on either list's order. */
+static BOOL ldr_windows_order_enabled(void)
+{
+    static int on = -1;
+    if (on < 0)
+    {
+        UNICODE_STRING nm, val;
+        WCHAR buf[8];
+        RtlInitUnicodeString( &nm, L"MADEIRA_LDR_WINDOWS_ORDER" );
+        val.Buffer = buf; val.Length = 0; val.MaximumLength = sizeof(buf);
+        on = (!RtlQueryEnvironmentVariable_U( NULL, &nm, &val ) && val.Length == sizeof(WCHAR) && buf[0] == '1');
+    }
+    return on;
+}
+
+static WINE_MODREF *ldr_order_ntdll(void)
+{
+    MEMORY_BASIC_INFORMATION meminfo;
+
+    if (NtQueryVirtualMemory( GetCurrentProcess(), LdrInitializeThunk, MemoryBasicInformation,
+                              &meminfo, sizeof(meminfo), NULL )) return NULL;
+    return get_modref( meminfo.AllocationBase );
+}
+
+static void ldr_order_ntdll_first(void)
+{
+    WINE_MODREF *ntdll;
+
+    if (!ldr_windows_order_enabled() || !(ntdll = ldr_order_ntdll())) return;
+    if (ntdll->ldr.InInitializationOrderLinks.Flink) return;
+    InsertHeadList( &NtCurrentTeb()->Peb->LdrData->InInitializationOrderModuleList,
+                    &ntdll->ldr.InInitializationOrderLinks );
+    ERR( "[ldr-order] ntdll heads InInitializationOrderModuleList (MADEIRA_LDR_WINDOWS_ORDER)\n" );
+}
+
+static BOOL ldr_order_keeps_place( LDR_DATA_TABLE_ENTRY *mod, WINE_MODREF *exe, WINE_MODREF *ntdll,
+                                   WINE_MODREF *kernel32 )
+{
+    UNICODE_STRING kernelbase = RTL_CONSTANT_STRING( L"kernelbase.dll" );
+
+    return mod == &exe->ldr || mod == &ntdll->ldr || mod == &kernel32->ldr ||
+           RtlEqualUnicodeString( &mod->BaseDllName, &kernelbase, TRUE );
+}
+
+static void ldr_order_move_rest( LIST_ENTRY *list, size_t link, WINE_MODREF *exe, WINE_MODREF *ntdll,
+                                 WINE_MODREF *kernel32 )
+{
+    LIST_ENTRY rest, *entry, *next;
+
+    InitializeListHead( &rest );
+    for (entry = list->Flink; entry != list; entry = next)
+    {
+        next = entry->Flink;
+        if (ldr_order_keeps_place( (LDR_DATA_TABLE_ENTRY *)((char *)entry - link), exe, ntdll, kernel32 ))
+            continue;
+        RemoveEntryList( entry );
+        InsertTailList( &rest, entry );
+    }
+    while (!IsListEmpty( &rest ))
+    {
+        entry = RemoveHeadList( &rest );
+        InsertTailList( list, entry );
+    }
+}
+
+static void ldr_order_windows_lists( WINE_MODREF *exe, WINE_MODREF *kernel32 )
+{
+    PEB_LDR_DATA *ldr = NtCurrentTeb()->Peb->LdrData;
+    WINE_MODREF *ntdll;
+    LIST_ENTRY *entry;
+    int i = 0;
+
+    if (!ldr_windows_order_enabled() || !(ntdll = ldr_order_ntdll())) return;
+    ldr_order_move_rest( &ldr->InLoadOrderModuleList, offsetof( LDR_DATA_TABLE_ENTRY, InLoadOrderLinks ),
+                         exe, ntdll, kernel32 );
+    ldr_order_move_rest( &ldr->InMemoryOrderModuleList, offsetof( LDR_DATA_TABLE_ENTRY, InMemoryOrderLinks ),
+                         exe, ntdll, kernel32 );
+    for (entry = ldr->InLoadOrderModuleList.Flink; entry != &ldr->InLoadOrderModuleList && i < 8; entry = entry->Flink)
+        ERR( "[ldr-order] load #%d %s\n", i++,
+             debugstr_us( &CONTAINING_RECORD( entry, LDR_DATA_TABLE_ENTRY, InLoadOrderLinks )->BaseDllName ) );
+    i = 0;
+    for (entry = ldr->InInitializationOrderModuleList.Flink;
+         entry != &ldr->InInitializationOrderModuleList && i < 6; entry = entry->Flink)
+        ERR( "[ldr-order] init #%d %s\n", i++,
+             debugstr_us( &CONTAINING_RECORD( entry, LDR_DATA_TABLE_ENTRY, InInitializationOrderLinks )->BaseDllName ) );
+}
+
 static void load_arm64ec_module(void)
 {
     ULONG buffer[16];
@@ -5802,6 +5932,7 @@ void loader_init( CONTEXT *context, void **entry )
          * actctx available so the activeCodePage manifest still applies. */
         locale_init();
         ERR( "loader_init: [iOS] early locale_init done (casemap wired before arm64ec module)\n" );
+        ldr_order_ntdll_first();
         ERR( "loader_init: calling load_arm64ec_module\n" );
         load_arm64ec_module();
         ERR( "loader_init: load_arm64ec_module returned, calling update_load_config\n" );
@@ -5815,6 +5946,9 @@ void loader_init( CONTEXT *context, void **entry )
             NtTerminateProcess( GetCurrentProcess(), status );
         }
         node_kernel32 = kernel32->ldr.DdagNode;
+#ifdef __arm64ec__
+        ldr_order_windows_lists( wm, kernel32 );
+#endif
         pBaseThreadInitThunk = RtlFindExportedRoutineByName( kernel32->ldr.DllBase, "BaseThreadInitThunk" );
         LdrGetProcedureAddress( kernel32->ldr.DllBase, &ctrl_routine, 0, (void **)&pCtrlRoutine );
 

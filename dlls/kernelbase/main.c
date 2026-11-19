@@ -49,8 +49,24 @@ BOOL WINAPI DllMain( HINSTANCE hinst, DWORD reason, LPVOID reserved )
         init_locale( hinst );
         init_startup_info( NtCurrentTeb()->Peb->ProcessParameters );
         init_console();
+        crash_report_init();   /* (crash-report) reads env.MADEIRA_CRASH_REPORT once */
     }
     return TRUE;
+}
+
+
+/***********************************************************************
+ *           IsDeveloperModeEnabled   (kernelbase.@)
+ *
+ * Windows' Developer Mode switch. Some games' own d3d12.dll delay-loads it
+ * (api-ms-win-appmodel-unlock-l1-1-0) during DllMain and aborts when it is
+ * missing. Madeira reports Developer Mode as off.
+ */
+HRESULT WINAPI IsDeveloperModeEnabled( BOOL *enabled )
+{
+    FIXME( "(%p) stub, reporting off\n", enabled );
+    if (enabled) *enabled = FALSE;   /* IsBadWritePtr is kernel32's; kernelbase cannot import it */
+    return S_OK;
 }
 
 

@@ -58,6 +58,7 @@
 #ifdef __APPLE__
 # include <mach/mach_time.h>
 # include <mach/mach.h>
+# include <mach/thread_switch.h>   /* madeira-duo: NtYieldExecution without depression */
 # include <mach/mach_vm.h>
 #endif
 #ifdef HAVE_KQUEUE
@@ -3603,6 +3604,36 @@ NTSTATUS WINAPI NtYieldExecution(void)
         }
     }
 #endif
+#ifdef WINE_IOS
+    /* madeira-duo (6 Nov 2026): no priority depression. Darwin's sched_yield is
+     * swtch_pri(0), which drops the thread to priority 0 for up to one quantum
+     * (10 ms) whenever anything else is runnable (xnu syscall_subr.c,
+     * thread_depress_abstime; Apple's tech talk 110147 says the same). PoE2's Main
+     * spent 26 % of its CPU yielding in prof9's capped stretch, with 16-22 threads
+     * runnable, so each yield put the frame's own thread behind utility work.
+     * thread_switch with SWITCH_OPTION_NONE gives up the core without it.
+     * Opt-in: madeira.cfg yield-depress = 0 (the default 1 keeps sched_yield). */
+    {
+        static int ios_ydepress = -1;
+        int value = __atomic_load_n( &ios_ydepress, __ATOMIC_ACQUIRE );
+        if (value < 0)
+        {
+            int expected = -1;
+            value = madeira_cfg_int( "yield-depress", 1 ) ? 1 : 0;
+            if (__atomic_compare_exchange_n( &ios_ydepress, &expected, value, 0, __ATOMIC_RELEASE, __ATOMIC_ACQUIRE ))
+            {
+                if (!value)
+                    fprintf( stderr, "[sync-census] yield-depress = 0: NtYieldExecution gives up the core with thread_switch, without priority depression\n" );
+            }
+            else value = expected;
+        }
+        if (!value)
+        {
+            thread_switch( MACH_PORT_NULL, SWITCH_OPTION_NONE, 0 );
+            return STATUS_SUCCESS;
+        }
+    }
+#endif
 #ifdef HAVE_SCHED_YIELD
 #ifdef RUSAGE_THREAD
     struct rusage u1, u2;
@@ -5292,6 +5323,43 @@ static LONGLONG update_timeout( ULONGLONG end )
 #endif
 
 
+/* iOS-Madeira bnet-alert-recheck: Battle.net launcher freeze (logs 83733182,
+ * b42cd042). [waiters] showed a renderer tile worker parked INF on an SRW lock's
+ * `owners` (lock+2) while the lock word read 00000002: one exclusive waiter
+ * counted, owners 0, i.e. the lock was FREE and the waiter was never woken
+ * (same picture, same lock layout, in both frozen runs). The wake was lost
+ * somewhere between RtlReleaseSRWLockExclusive and this wait; cause not known.
+ * With env MADEIRA_ALERT_RECHECK_MS=N (default 0 = off) a wait that has a
+ * readable address wakes every N ms and re-reads the aligned word holding it.
+ * Unchanged: keep waiting. Changed: give a real alert 20 ms more, then return
+ * STATUS_ALERTED as a spurious wake-up (allowed for WaitOnAddress, SRW and
+ * condition variables; callers re-check) and log [alert-lost] once per event.
+ * Turns a permanent freeze into a hiccup of at most N ms, and the log line
+ * proves (or disproves) the lost wake-up on device. */
+static int ios_alert_recheck_ms = -1;
+static LONG ios_alert_lost_n, ios_alert_lost_logged;
+static int ios_alert_recheck(void)
+{
+    if (ios_alert_recheck_ms < 0)
+    {
+        const char *e = getenv( "MADEIRA_ALERT_RECHECK_MS" );
+        int v = e ? atoi( e ) : 0;
+        if (v < 0) v = 0;
+        if (v > 60000) v = 60000;
+        if (v && v < 20) v = 20;
+        ios_alert_recheck_ms = v;
+        if (v) fprintf( stderr, "[alert-recheck] on: re-read the wait word every %d ms rev=bnet-alert-recheck\n", v );
+    }
+    return ios_alert_recheck_ms;
+}
+static int ios_alert_ring_hits( unsigned int tid )
+{
+    int i, n = 0;
+    for (i = 0; i < IOS_ALERT_RING; i++)
+        if ((ios_alert_ring[i] & 0xffff) == (tid & 0xffff)) n++;
+    return n;
+}
+
 /***********************************************************************
  *             NtWaitForAlertByThreadId (NTDLL.@)
  */
@@ -5371,16 +5439,38 @@ NTSTATUS WINAPI NtWaitForAlertByThreadId( const void *address, const LARGE_INTEG
             while (!*(volatile LONG *)futex && mach_absolute_time() < spin_end) __asm__ __volatile__( "yield" );
             if (*(volatile LONG *)futex) __sync_fetch_and_add( &ios_alert_spin_hits, 1 );
         }
+        /* bnet-alert-recheck: snapshot the aligned word holding `address` */
+        int ios_rc = ios_alert_recheck(), ios_capped = 0, ios_snap_ok = 0;
+        unsigned int ios_snap = 0;
+        const void *ios_al = (const void *)((ULONG_PTR)address & ~(ULONG_PTR)3);
+        unsigned long long ios_wait_t0 = mach_absolute_time();
+        if (ios_rc && (ULONG_PTR)address > 0x10000 && (ULONG_PTR)address < 0x8000000000ULL)
+            ios_snap_ok = ios_alert_waiter_read( &ios_snap, ios_al, sizeof(ios_snap) );
+
         while (!InterlockedExchange( futex, 0 ))
         {
             unsigned long long ios_woke;
+            ios_capped = 0;
             if (timeout)
             {
                 LONGLONG timeleft = update_timeout( end );
                 struct timespec timespec;
 
+                if (ios_snap_ok && timeleft > (LONGLONG)ios_rc * 10000)
+                {
+                    timeleft = (LONGLONG)ios_rc * 10000;
+                    ios_capped = 1;
+                }
                 timespec.tv_sec = timeleft / (ULONGLONG)TICKSPERSEC;
                 timespec.tv_nsec = (timeleft % TICKSPERSEC) * 100;
+                ret = futex_wait( futex, 0, &timespec );
+            }
+            else if (ios_snap_ok)
+            {
+                struct timespec timespec;
+                timespec.tv_sec = ios_rc / 1000;
+                timespec.tv_nsec = (long)(ios_rc % 1000) * 1000000;
+                ios_capped = 1;
                 ret = futex_wait( futex, 0, &timespec );
             }
             else
@@ -5398,6 +5488,34 @@ NTSTATUS WINAPI NtWaitForAlertByThreadId( const void *address, const LARGE_INTEG
                 }
             }
 
+            if (ret == -1 && errno == ETIMEDOUT && ios_capped)
+            {
+                unsigned int ios_now_w;
+                if (ios_alert_waiter_read( &ios_now_w, ios_al, sizeof(ios_now_w) ) && ios_now_w != ios_snap)
+                {
+                    /* the word moved: give the real alert 20 ms to arrive */
+                    struct timespec grace = { 0, 20000000 };
+                    if (!*(volatile LONG *)futex) futex_wait( futex, 0, &grace );
+                    if (!*(volatile LONG *)futex)
+                    {
+                        unsigned int me = (unsigned int)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread;
+                        LONG n = InterlockedIncrement( &ios_alert_lost_n );
+                        if (ios_alert_lost_logged < 64 || (n & 255) == 0)
+                        {
+                            InterlockedIncrement( &ios_alert_lost_logged );
+                            fprintf( stderr, "[alert-lost] #%d tid=%04x addr=%p word %08x->%08x after %.0f ms %s, no alert came; "
+                                     "alerts to this tid in ring=%d; spurious wake returned rev=bnet-alert-recheck\n",
+                                     (int)n, me, address, ios_snap, ios_now_w,
+                                     (mach_absolute_time() - ios_wait_t0) / ios_ticks_per_us() / 1000.0,
+                                     timeout ? "TMO" : "INF", ios_alert_ring_hits( me ) );
+                        }
+                        if (ios_wslot >= 0) ios_alert_waiters[ios_wslot].addr = NULL;
+                        return STATUS_ALERTED;
+                    }
+                    continue;   /* the alert arrived in the grace period */
+                }
+                if (!timeout || update_timeout( end ) > 0) continue;   /* nothing changed: keep waiting */
+            }
             if (ret == -1 && errno == ETIMEDOUT)
             {
                 if (ios_wslot >= 0) ios_alert_waiters[ios_wslot].addr = NULL;

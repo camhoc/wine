@@ -1891,6 +1891,26 @@ static void ios_log_unmap( void *addr )
     }
 }
 
+/* MADEIRA_MAP_EXEC_VIEW, read once: 0 not yet, 1 off (value "0"), 2 on (default). */
+static BOOL ios_map_exec_view_enabled( void )
+{
+    static LONG mode;
+
+    if (!mode)
+    {
+        UNICODE_STRING name, value;
+        WCHAR buffer[2];
+
+        RtlInitUnicodeString( &name, L"MADEIRA_MAP_EXEC_VIEW" );
+        value.Buffer = buffer;
+        value.Length = 0;
+        value.MaximumLength = sizeof(buffer);
+        mode = (!RtlQueryEnvironmentVariable_U( NULL, &name, &value ) &&
+                value.Length == sizeof(WCHAR) && buffer[0] == '0') ? 1 : 2;
+    }
+    return mode == 2;
+}
+
 static void notify_map_view_of_section( HANDLE handle, void *addr, SIZE_T size, ULONG alloc,
                                         ULONG protect, NTSTATUS *ret_status )
 {
@@ -1918,6 +1938,24 @@ static void notify_map_view_of_section( HANDLE handle, void *addr, SIZE_T size, 
     if (!NtCurrentTeb()->Tib.ArbitraryUserPointer)
     {
         static int skip_aup;
+        /* map-exec-view: a view mapped with no ArbitraryUserPointer is not a loader image map,
+         * so it is not handed to NotifyMapViewOfSection. If its protection asks for execute,
+         * though (StarCraft's ClientSdk.dll: the image section mapped as plain data, protected
+         * RWX, unmapped, then mapped again in pieces with the .text as PAGE_EXECUTE_READ), FEX
+         * never learns the range is code: the unmap removed it from XIntervals and nothing adds
+         * it back, so the first decode there is NOEXEC and the process dies with c0000005.
+         * Tell FEX the way an [exec-req] NtProtectVirtualMemory does: the post-protect
+         * notification for the same address, size and protection. Views with an
+         * ArbitraryUserPointer and views without execute are left alone. */
+        if ((protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY))
+            && pNotifyMemoryProtect && ios_map_exec_view_enabled())
+        {
+            static LONG exec_view_n;
+            LONG n = InterlockedIncrement( &exec_view_n );
+            if (n <= 16)
+                ERR( "[map-exec-view] #%d base=%p size=%p prot=%x\n", (int)n, addr, (void *)size, protect );
+            pNotifyMemoryProtect( addr, size, protect, TRUE, STATUS_SUCCESS );
+        }
         if (skip_aup < 20)
         { skip_aup++; ERR( "[map-notify] SKIP (no ArbitraryUserPointer) addr=%p size=%p\n", addr, (void *)size ); }
         return;

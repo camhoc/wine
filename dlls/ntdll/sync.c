@@ -1375,6 +1375,48 @@ static BOOL compare_addr( const void *addr, const void *cmp, SIZE_T size )
     return FALSE;
 }
 
+/* iOS-Madeira bnet-woa-recheck (bnettest16): bnettest15's unix-side recheck
+ * (log 0697ade8) caught 80 lost wake-ups but still froze: renderer tid 0520 sat
+ * 958 s on SRW lock+2 with the lock word 00000002 (owners 0 = FREE). The wake
+ * was lost BEFORE the unix wait began (release + wake ran between our compare
+ * and the futex wait, and the waker did not find our queue entry), so the unix
+ * snapshot already held the released value and never changed. Only this
+ * function knows the caller's `cmp`, so recheck here: with the Windows env
+ * variable MADEIRA_ALERT_RECHECK_MS=N (game config; default off) an INFINITE
+ * wait sleeps in N ms slices and, after each, returns SUCCESS (a spurious
+ * wake-up, which every caller handles) once *addr no longer equals *cmp. */
+static int ios_woa_rc = -1;
+static LONG ios_woa_lost_n;
+static int ios_woa_recheck_ms(void)
+{
+    int rc = ios_woa_rc;
+    if (rc < 0)
+    {
+        static const char name[] = "MADEIRA_ALERT_RECHECK_MS=";
+        const RTL_USER_PROCESS_PARAMETERS *pp = NtCurrentTeb()->Peb->ProcessParameters;
+        const WCHAR *p = pp ? pp->Environment : NULL;
+        int v = 0;
+        while (p && *p)
+        {
+            int i = 0;
+            while (name[i] && p[i] == (WCHAR)name[i]) i++;
+            if (!name[i])
+            {
+                const WCHAR *d = p + i;
+                while (*d >= '0' && *d <= '9' && v < 100000) v = v * 10 + (*d++ - '0');
+                break;
+            }
+            while (*p) p++;
+            p++;
+        }
+        if (v > 60000) v = 60000;
+        if (v && v < 20) v = 20;
+        rc = ios_woa_rc = v;
+        if (v) ERR( "[woa-recheck] on: INFINITE RtlWaitOnAddress re-compares every %d ms rev=bnet-woa-recheck\n", v );
+    }
+    return rc;
+}
+
 /***********************************************************************
  *           RtlWaitOnAddress   (NTDLL.@)
  */
@@ -1428,7 +1470,30 @@ NTSTATUS WINAPI RtlWaitOnAddress( const void *addr, const void *cmp, SIZE_T size
     /* ml441: pass the real address — the unix layer ignores it functionally
      * but the [waiters] registry (ml440) records it, so long parks are now
      * attributable to a named lock word. */
-    ret = NtWaitForAlertByThreadId( addr, timeout );
+    if (!timeout && ios_woa_recheck_ms() > 0)
+    {
+        /* bnet-woa-recheck: finite slices, re-compare against the caller's value */
+        LARGE_INTEGER slice;
+        ULONG slices = 0;
+        slice.QuadPart = -(LONGLONG)ios_woa_recheck_ms() * 10000;
+        for (;;)
+        {
+            ret = NtWaitForAlertByThreadId( addr, &slice );
+            if (ret != STATUS_TIMEOUT) break;
+            slices++;
+            if (!compare_addr( addr, cmp, size ))
+            {
+                LONG n = InterlockedIncrement( &ios_woa_lost_n );
+                if (n <= 64 || !(n & 255))
+                    ERR( "[woa-lost] #%ld tid=%04lx addr=%p size=%Iu value changed with no wake after %lu ms; spurious wake returned rev=bnet-woa-recheck\n",
+                         n, GetCurrentThreadId(), addr, size, slices * (ULONG)ios_woa_recheck_ms() );
+                ret = STATUS_SUCCESS;
+                break;
+            }
+        }
+    }
+    else
+        ret = NtWaitForAlertByThreadId( addr, timeout );
 
     if (NtCurrentTeb()->Instrumentation[10] == (void *)(ULONG_PTR)0x504d5550)
     {
@@ -1439,7 +1504,7 @@ NTSTATUS WINAPI RtlWaitOnAddress( const void *addr, const void *cmp, SIZE_T size
     }
 
     /* We may have already been removed by a call to RtlWakeAddressSingle() or RtlWakeAddressAll(). */
-    if (entry.addr)
+    if (ReadPointerAcquire( (void * volatile *)&entry.addr ))
     {
         spin_lock( &queue->lock );
         if (entry.addr)
@@ -1462,6 +1527,7 @@ void WINAPI RtlWakeAddressAll( const void *addr )
     struct futex_entry *entry, *next;
     unsigned int count = 0;
     HANDLE tids[256];
+    DWORD tid;
 
     if (!ios_sync_lean) InterlockedIncrement64( &ios_xp_nt.woa_wake_all );   /* ml1131 */
 
@@ -1478,14 +1544,15 @@ void WINAPI RtlWakeAddressAll( const void *addr )
     {
         if (entry->addr == addr)
         {
-            entry->addr = NULL;
+            tid = entry->tid;
             list_remove( &entry->entry );
+            WritePointerRelease( (void * volatile *)&entry->addr, NULL );
             if (count == ARRAY_SIZE(tids))
             {
                 NtAlertMultipleThreadByThreadId( tids, count, NULL, NULL );
                 count = 0;
             }
-            tids[count++] = (HANDLE)(ULONG_PTR)entry->tid;
+            tids[count++] = (HANDLE)(ULONG_PTR)tid;
         }
     }
 
@@ -1528,8 +1595,8 @@ void WINAPI RtlWakeAddressSingle( const void *addr )
             /* Remove this entry from the queue, so that a simultaneous call to
              * RtlWakeAddressSingle() will not also wake it—two simultaneous
              * calls must wake at least two waiters if they exist. */
-            entry->addr = NULL;
             list_remove( &entry->entry );
+            WritePointerRelease( (void * volatile *)&entry->addr, NULL );
             break;
         }
     }

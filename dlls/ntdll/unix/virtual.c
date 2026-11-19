@@ -4486,6 +4486,45 @@ void virtual_init_user_shared_data(void)
 }
 
 
+#ifdef WINE_IOS
+/* iOS-Madeira [kusd-fill]: the static KUSER_SHARED_DATA fields
+ * (TickCountMultiplier, ActiveProcessorCount, NativeProcessorArchitecture,
+ * NXSupportPolicy, cpu features) are written only by the parentless process
+ * that runs wineboot (run_wineboot -> virtual_init_user_shared_data). A
+ * Madeira session whose first process does not take that path leaves them 0:
+ * Call of Duty Black Ops III (2026-11-15) computes its own tick count as
+ * (TickCount * TickCountMultiplier) >> 24, always gets 0 and spins forever on
+ * its start screen. Fill them once per session from any process that finds
+ * them empty. env MADEIRA_KUSD_FILL=0 turns it off. */
+void madeira_kusd_fill_if_empty(void)
+{
+    UNICODE_STRING name_str = RTL_CONSTANT_STRING( shared_data_nameW );
+    OBJECT_ATTRIBUTES attr = { sizeof(attr), 0, &name_str };
+    const char *env = getenv( "MADEIRA_KUSD_FILL" );
+    KUSER_SHARED_DATA *data;
+    HANDLE section;
+    int fd, needs_close;
+    ULONG mult;
+
+    if (env && env[0] == '0') return;
+    if (NtOpenSection( &section, SECTION_MAP_READ, &attr )) return;
+    if (server_get_unix_fd( section, 0, &fd, &needs_close, NULL, NULL ))
+    {
+        NtClose( section );
+        return;
+    }
+    data = mmap( NULL, sizeof(*data), PROT_READ, MAP_SHARED, fd, 0 );
+    if (needs_close) close( fd );
+    NtClose( section );
+    if (data == MAP_FAILED) return;
+    mult = data->TickCountMultiplier;
+    munmap( data, sizeof(*data) );
+    if (mult) return;
+    ERR( "[kusd-fill] TickCountMultiplier was 0: filling the static KUSER_SHARED_DATA fields\n" );
+    virtual_init_user_shared_data();
+}
+#endif
+
 struct thread_stack_info
 {
     char  *start;
