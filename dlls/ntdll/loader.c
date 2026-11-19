@@ -1498,7 +1498,7 @@ static BOOL import_dll( WINE_MODREF *wm, const IMAGE_IMPORT_DESCRIPTOR *descr, L
      * x11=garbage. */
     const IMAGE_ARM64EC_METADATA *imp_metadata = NULL;
     if (arm64ec_get_module_metadata( module ))  /* importer is ARM64EC */
-        imp_metadata = arm64ec_get_module_metadata( imp_mod );
+        imp_metadata = arm64ec_get_module_metadata( context.module );
 #endif
 
     while (import_list->u1.Ordinal)
@@ -1521,7 +1521,7 @@ static BOOL import_dll( WINE_MODREF *wm, const IMAGE_IMPORT_DESCRIPTOR *descr, L
             }
 #ifdef __arm64ec__
             else if (imp_metadata && !arm64ec_iat_is_exported_x64( module, thunk_list ))
-                thunk_list->u1.Function = (ULONG_PTR)arm64ec_redirect_import( imp_mod,
+                thunk_list->u1.Function = (ULONG_PTR)arm64ec_redirect_import( context.module,
                                                                               (void *)thunk_list->u1.Function,
                                                                               imp_metadata );
 #endif
@@ -1545,7 +1545,7 @@ static BOOL import_dll( WINE_MODREF *wm, const IMAGE_IMPORT_DESCRIPTOR *descr, L
             {
                 void *pre = (void *)thunk_list->u1.Function;
 
-                thunk_list->u1.Function = (ULONG_PTR)arm64ec_redirect_import( imp_mod,
+                thunk_list->u1.Function = (ULONG_PTR)arm64ec_redirect_import( context.module,
                                                                               (void *)thunk_list->u1.Function,
                                                                               imp_metadata );
                 /* iOS-Madeira ml230: does the EC->EC import bind actually land on native

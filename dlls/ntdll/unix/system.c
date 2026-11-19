@@ -830,6 +830,19 @@ void init_shared_data_cpuinfo( KUSER_SHARED_DATA *data )
         features[PF_SSSE3_INSTRUCTIONS_AVAILABLE]  = TRUE;
         features[PF_SSE4_1_INSTRUCTIONS_AVAILABLE] = TRUE;
         features[PF_SSE4_2_INSTRUCTIONS_AVAILABLE] = TRUE;
+#ifdef WINE_IOS
+        /* Madeira: Wine 11.22 reports AVX/AVX2 and an AVX XState area to every
+         * x86 guest on ARM64, because Microsoft's emulator runs them. Here the
+         * emulator is FEX, where AVX is opt-in (MADEIRA_FEX_AVX=1, ml1310): a
+         * game told "AVX is there" while FEX has it off takes a VEX path and
+         * dies on an illegal instruction. So keep the pre-merge rule: AVX is
+         * advertised only when FEX runs it. MADEIRA_KUSD_AVX=0 still leaves
+         * the XState configuration empty, as in virtual_ios.c. */
+        {
+            const char *avx = getenv( "MADEIRA_FEX_AVX" ), *kusd = getenv( "MADEIRA_KUSD_AVX" );
+            if (!(avx && avx[0] == '1' && !avx[1]) || (kusd && kusd[0] == '0' && !kusd[1])) return;
+        }
+#endif
         features[PF_AVX_INSTRUCTIONS_AVAILABLE]    = TRUE;
         features[PF_AVX2_INSTRUCTIONS_AVAILABLE]   = TRUE;
 

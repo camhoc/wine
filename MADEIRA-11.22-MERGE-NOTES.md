@@ -14,3 +14,16 @@
 - libs/vkd3d/libs/vkd3d-shader/fx.c: PENDING RE-PORT. 125hz's two fx_2_0 commits (8be7412f sampler initializers + pass assignments + shader object initializers, ddf92bab numeric states/TRUE/FALSE) collide with vkd3d 2.0/2.1, which now writes pass assignments itself (write_fx_2_state_assignment) but still has "Writing fx_2_0 sampler objects initializers is not implemented". For the first merge commit upstream's fx.c is taken as is; the Madeira delta is saved in pending/fx_2_0-madeira-vs-11.4.diff and must be re-applied on upstream's implementation (sampler initializers, zero default values, uniform-globals walk, anything upstream still lacks).
 - libs/vkd3d hlsl.h: kept madeira_nonuint_index_logged; the five option bools moved elsewhere upstream.
 - dlls/bcrypt/gnutls.c: file DELETED upstream (50c4a503b "bcrypt: Get rid of the unixlib"; bcrypt.dll is now PE-only on the bundled SymCrypt, libs/symcrypt). Both our patches there are DROPPED as moot: (a) the [bcrypt-guard] CBC length check existed only because nettle aborts the process; 11.22 bcrypt_main.c checks "if (input_len & (block_size - 1)) return STATUS_INVALID_BUFFER_SIZE;" itself; (b) the WoW64 thunks' ios_wow_host_ptr conversions, since there are no unix thunks left. TODO Madeira repo: bcrypt no longer needs the gnutls unix side (build/crypto-unix keeps crypt32/secur32); the PE build must now build libs/symcrypt.
+- dlls/ntdll/unix/system.c init_shared_data_cpuinfo: NEW upstream behaviour gated. 11.22 sets PF_AVX/PF_AVX2 and an AVX XState configuration for every x86 guest on ARM64. Under WINE_IOS this now happens only with MADEIRA_FEX_AVX=1 (and not MADEIRA_KUSD_AVX=0), which is the rule our ml1310 block in virtual_ios.c already used. Off switch = the existing ones. When virtual_ios.c is ported the ml1310 block becomes redundant (upstream fills the same layout).
+
+## Compile check in the cloud (Nov 19)
+Configured for i386, x86_64, aarch64, arm64ec with clang 18 + lld on Linux and built every module the
+Madeira tree changes, plus bcrypt, d3dcompiler_47, d3dx9_36 and the wineserver.
+- Found and fixed: `dlls/ntdll/loader.c` (`imp_mod` no longer exists, now `context.module`);
+  `dlls/wow64/process.c` (two `case PS_ATTRIBUTE_GROUP_AFFINITY`: 11.22 converts the whole structure
+  because the mask is 4 bytes for the guest, so our pointer-only case is dropped and upstream's case reads
+  the guest address through `guest_ptr32`).
+- Not ours: clang 18 crashes on upstream's i386 inline assembly in `dlls/dinput/dinput.c`, and has no
+  `-marm64x`. The real toolchain on the PC does not have either limit.
+- Cannot be checked here: everything under `WINE_IOS` / `__APPLE__` (no iOS SDK in the cloud), e.g.
+  `dlls/ntdll/unix/sync.c` stops at the Apple-only QoS and Mach code.
