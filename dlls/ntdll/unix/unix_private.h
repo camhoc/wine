@@ -129,8 +129,11 @@ static inline BOOL is_arm64ec(void)
 
 static inline ULONG_PTR get_system_affinity_mask(void)
 {
-    if (cpu_count >= sizeof(ULONG_PTR) * 8) return ~(ULONG_PTR)0;
-    return ((ULONG_PTR)1 << cpu_count) - 1;
+    /* Madeira ml1122: the mask follows the processor count the program is told (the PEB
+     * count), as it did before Wine 11.22 moved this helper off the PEB. */
+    ULONG count = madeira_peb_cpu_count ? madeira_peb_cpu_count : cpu_count;
+    if (count >= sizeof(ULONG_PTR) * 8) return ~(ULONG_PTR)0;
+    return ((ULONG_PTR)1 << count) - 1;
 }
 
 
@@ -273,8 +276,15 @@ extern NTSTATUS load_builtin( struct pe_mapping_info *pe_mapping, USHORT machine
                               ULONG_PTR limit_low, ULONG_PTR limit_high, off_t offset );
 extern NTSTATUS load_unixlib_by_name( const UNICODE_STRING *nt_name, void **handle_ret );
 extern BOOL is_system_dir_path( const UNICODE_STRING *path, WORD *machine );
+#ifdef WINE_IOS
+/* Madeira: every pseudo-process loads its own main image in the one shared unix lib,
+ * so the image base is handed back to the caller instead of living in main_module. */
+extern NTSTATUS load_main_exe( UNICODE_STRING *nt_name, USHORT load_machine, void **module );
+extern NTSTATUS load_start_exe( UNICODE_STRING *nt_name, void **module );
+#else
 extern NTSTATUS load_main_exe( UNICODE_STRING *nt_name, USHORT load_machine );
 extern NTSTATUS load_start_exe( UNICODE_STRING *nt_name );
+#endif
 extern ULONG_PTR redirect_arm64ec_rva( void *module, ULONG_PTR rva, const IMAGE_ARM64EC_METADATA *metadata );
 extern void start_server( BOOL debug );
 
