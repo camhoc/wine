@@ -1417,6 +1417,73 @@ static int ios_woa_recheck_ms(void)
     return rc;
 }
 
+/* iOS-Madeira bnet-woa-split (diagnostic only, reads state, changes nothing):
+ * when [woa-lost] fires, say WHICH half of the wake path failed.
+ *   ours=queued   -> no waker ever dequeued this entry: the wake was never
+ *                    issued for this address, or went to another table/entry
+ *                    (or, for a condition variable, a legitimate wake-one of
+ *                    a sibling: check others=).
+ *   ours=dequeued -> a waker removed the entry and alerted our tid, but the
+ *                    alert never ended the unix wait: the unix alert/futex side.
+ * others= counts the other waiters still queued on the same address.  For a
+ * size-2 wait at (word+2) the whole SRW word is printed (exclusive_waiters in
+ * the low half, owners in the high half).  Off with MADEIRA_WOA_SPLIT=0 in the
+ * game config (default on whenever MADEIRA_ALERT_RECHECK_MS is set). */
+static int ios_woa_split = -1;
+static int ios_woa_split_on(void)
+{
+    if (ios_woa_split < 0)
+    {
+        static const char name[] = "MADEIRA_WOA_SPLIT=0";
+        const RTL_USER_PROCESS_PARAMETERS *pp = NtCurrentTeb()->Peb->ProcessParameters;
+        const WCHAR *p = pp ? pp->Environment : NULL;
+        int on = 1;
+        while (p && *p)
+        {
+            int i = 0;
+            while (name[i] && p[i] == (WCHAR)name[i]) i++;
+            if (!name[i] && !p[i]) { on = 0; break; }
+            while (*p) p++;
+            p++;
+        }
+        ios_woa_split = on;
+    }
+    return ios_woa_split;
+}
+
+static void ios_woa_split_note( LONG n, struct futex_queue *queue, struct futex_entry *ours,
+                                const void *addr, SIZE_T size )
+{
+    struct futex_entry *e;
+    int others = 0, ours_listed = 0;
+    BOOL queued = ReadPointerAcquire( (void * volatile *)&ours->addr ) != NULL;
+    ULONG word = 0;
+    BOOL have_word = FALSE;
+
+    spin_lock( &queue->lock );
+    if (queue->queue.next)
+    {
+        LIST_FOR_EACH_ENTRY( e, &queue->queue, struct futex_entry, entry )
+        {
+            if (e == ours) ours_listed = 1;
+            else if (e->addr == addr) others++;
+        }
+    }
+    spin_unlock( &queue->lock );
+
+    if (size == 2 && ((ULONG_PTR)addr & 3) == 2)
+    {
+        word = *(const volatile ULONG *)((const char *)addr - 2);
+        have_word = TRUE;
+    }
+    if (have_word)
+        ERR( "[woa-split] #%ld tid=%04lx addr=%p ours=%s listed=%d others=%d srw_word=%08lx rev=bnet-woa-split\n",
+             n, GetCurrentThreadId(), addr, queued ? "queued" : "dequeued", ours_listed, others, word );
+    else
+        ERR( "[woa-split] #%ld tid=%04lx addr=%p ours=%s listed=%d others=%d rev=bnet-woa-split\n",
+             n, GetCurrentThreadId(), addr, queued ? "queued" : "dequeued", ours_listed, others );
+}
+
 /***********************************************************************
  *           RtlWaitOnAddress   (NTDLL.@)
  */
@@ -1485,8 +1552,11 @@ NTSTATUS WINAPI RtlWaitOnAddress( const void *addr, const void *cmp, SIZE_T size
             {
                 LONG n = InterlockedIncrement( &ios_woa_lost_n );
                 if (n <= 64 || !(n & 255))
+                {
                     ERR( "[woa-lost] #%ld tid=%04lx addr=%p size=%Iu value changed with no wake after %lu ms; spurious wake returned rev=bnet-woa-recheck\n",
                          n, GetCurrentThreadId(), addr, size, slices * (ULONG)ios_woa_recheck_ms() );
+                    if (ios_woa_split_on()) ios_woa_split_note( n, queue, &entry, addr, size );
+                }
                 ret = STATUS_SUCCESS;
                 break;
             }

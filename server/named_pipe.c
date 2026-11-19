@@ -41,6 +41,10 @@
 #include "security.h"
 #include "process.h"
 
+/* [pipe-census] defined further down; pipe_end_destroy calls it first. */
+struct pipe_end;
+static void ios_pipe_census_del( struct pipe_end *end );
+
 struct named_pipe;
 
 struct pipe_message
@@ -496,6 +500,9 @@ static void pipe_end_destroy( struct object *obj )
     struct pipe_end *pipe_end = (struct pipe_end *)obj;
     struct pipe_message *message;
 
+#ifdef WINE_IOS
+    ios_pipe_census_del( pipe_end );   /* [pipe-census] */
+#endif
     pipe_end_disconnect( pipe_end, STATUS_PIPE_BROKEN );
 
     while (!list_empty( &pipe_end->message_queue ))
@@ -1407,6 +1414,82 @@ static void pipe_client_ioctl( struct fd *fd, ioctl_code_t code, struct async *a
     }
 }
 
+#ifdef WINE_IOS
+/* [pipe-census] (LOG ONLY): every live pipe end, so the 10 s diagnostic pass in
+ * build/wineserver/fd_ios.c can ask "is a reader queued on an end that already
+ * holds data?" -- a lost wake-up in the server. Battle.net (Chromium) talks
+ * browser <-> renderer over named pipes with overlapped reads + IOCP, and at its
+ * freeze every thread is idle. Nothing here changes pipe behaviour. */
+#define IOS_PIPE_CENSUS_MAX 4096
+static struct pipe_end *ios_pipe_ends[IOS_PIPE_CENSUS_MAX];
+static unsigned short ios_pipe_seen[IOS_PIPE_CENSUS_MAX];
+static unsigned int ios_pipe_dropped;
+
+static void ios_pipe_census_add( struct pipe_end *end )
+{
+    int i;
+    for (i = 0; i < IOS_PIPE_CENSUS_MAX; i++)
+        if (!ios_pipe_ends[i]) { ios_pipe_ends[i] = end; ios_pipe_seen[i] = 0; return; }
+    ios_pipe_dropped++;
+}
+
+static void ios_pipe_census_del( struct pipe_end *end )
+{
+    int i;
+    for (i = 0; i < IOS_PIPE_CENSUS_MAX; i++)
+        if (ios_pipe_ends[i] == end) { ios_pipe_ends[i] = NULL; return; }
+}
+
+static void ios_pipe_counts( struct pipe_end *end, unsigned int *msgs, unsigned int *bytes,
+                             unsigned int *readers, unsigned int *writers )
+{
+    struct pipe_message *m;
+    *msgs = *bytes = 0;
+    LIST_FOR_EACH_ENTRY( m, &end->message_queue, struct pipe_message, entry )
+    {
+        (*msgs)++;
+        if (m->iosb && m->iosb->in_size > m->read_pos) *bytes += m->iosb->in_size - m->read_pos;
+    }
+    *readers = list_count( &end->read_q.queue );
+    *writers = list_count( &end->write_q.queue );
+}
+
+void ios_pipe_census( void )
+{
+    int i, live = 0, waiting = 0, stuck = 0, rows = 0;
+    for (i = 0; i < IOS_PIPE_CENSUS_MAX; i++)
+    {
+        struct pipe_end *end = ios_pipe_ends[i];
+        unsigned int msgs, bytes, rd, wr, omsgs = 0, obytes = 0, ord = 0, owr = 0;
+        if (!end) continue;
+        live++;
+        ios_pipe_counts( end, &msgs, &bytes, &rd, &wr );
+        /* a queued but already-terminated async does not count: only a
+         * reader that is really still waiting (async_waiting, async.c) */
+        if (rd && !async_waiting( &end->read_q )) rd = 0;
+        if (rd) waiting++;
+        if (!(rd && msgs))
+        {
+            ios_pipe_seen[i] = 0;
+            continue;
+        }
+        if (ios_pipe_seen[i] < 0xffff) ios_pipe_seen[i]++;
+        if (ios_pipe_seen[i] < 2) continue;   /* the same end on two dumps in a row: 10 s+ */
+        stuck++;
+        if (rows >= 24) continue;
+        rows++;
+        if (end->connection) ios_pipe_counts( end->connection, &omsgs, &obytes, &ord, &owr );
+        fprintf( stderr, "[pipe-census] LOST-WAKE? end=%p %s state=%u flags=%x server_pid=%04x client_pid=%04x "
+                 "msgs=%u bytes=%u readers-waiting=%u writers=%u seen=%u | other end=%p msgs=%u readers=%u writers=%u\n",
+                 end, end->obj.ops == &pipe_server_ops ? "server" : "client", end->state, end->flags,
+                 end->server_pid, end->client_pid, msgs, bytes, rd, wr, ios_pipe_seen[i],
+                 end->connection, omsgs, ord, owr );
+    }
+    fprintf( stderr, "[pipe-census] ---- ends=%d with-reader-waiting=%d reader-waiting-on-data-10s+=%d shown=%d dropped=%u rev=pipe-census-1\n",
+             live, waiting, stuck, rows, ios_pipe_dropped );
+}
+#endif
+
 static void init_pipe_end( struct pipe_end *pipe_end, struct named_pipe *pipe,
                            unsigned int pipe_flags, data_size_t buffer_size )
 {
@@ -1418,6 +1501,9 @@ static void init_pipe_end( struct pipe_end *pipe_end, struct named_pipe *pipe,
     init_async_queue( &pipe_end->read_q );
     init_async_queue( &pipe_end->write_q );
     list_init( &pipe_end->message_queue );
+#ifdef WINE_IOS
+    ios_pipe_census_add( pipe_end );   /* [pipe-census] */
+#endif
 }
 
 static struct pipe_server *create_pipe_server( struct named_pipe *pipe, unsigned int options,

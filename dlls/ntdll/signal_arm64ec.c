@@ -602,6 +602,63 @@ static void arm64x_check_call(void);
  * to phase 2 (arm64ec_process_init_finish), which runs AFTER DllMains
  * because FEX's CRT init requires ucrtbase to be initialized.
  */
+/* rtcs-diag (Battle.net / Overwatch 2 test builds): diagnostic only, no behaviour change.
+ * In the Overwatch process pResetToConsistentState was NULL ("[rtcs] pre ... rtcs=0000000000000000"), so a
+ * brk #0 from FEX's guest-SIGTRAP stub reached the guest handler with the host rip and sp. This logs what
+ * the CPU module's ResetToConsistentState export looked like at init and whether the pointer is still the
+ * same at the first exceptions. MADEIRA_RTCS_DIAG=0 turns it off (read once; any other value leaves it on). */
+static void *rtcs_diag_raw, *rtcs_diag_init;
+static LONG rtcs_diag_hits;
+
+static BOOL rtcs_diag_enabled( void )
+{
+    static LONG mode;   /* 0 not yet, 1 off, 2 on */
+
+    if (!mode)
+    {
+        UNICODE_STRING name, value;
+        WCHAR buffer[2];
+
+        RtlInitUnicodeString( &name, L"MADEIRA_RTCS_DIAG" );
+        value.Buffer = buffer;
+        value.Length = 0;
+        value.MaximumLength = sizeof(buffer);
+        mode = (!RtlQueryEnvironmentVariable_U( NULL, &name, &value ) &&
+                value.Length == sizeof(WCHAR) && buffer[0] == '0') ? 1 : 2;
+    }
+    return mode == 2;
+}
+
+/* rtcs-diag2 (bnettest22): the bnettest21 log showed pointer, stored-at-init and export all reading 0 at
+ * the exception although init had set them (same thread). So either this .data page was cleared after init,
+ * or the exception runs in a DIFFERENT ntdll instance than the one init wrote. Log, at init and at the
+ * exception: where the static lives, which code instance is running (this function's address), the
+ * arm64x_check_call address init stashed in PEB.WerRegistrationData versus this instance's own, and an
+ * FNV-1a hash of the 4 KB page holding the static. Same off switch: MADEIRA_RTCS_DIAG=0. */
+/* returns the FNV-1a hash; *nz = non-zero bytes in the page (a page cleared after init shows only the few
+ * bytes the diag's own counters wrote since, instead of hundreds) */
+static unsigned int rtcs_diag_page_fnv( const void *p, unsigned int *nz )
+{
+    const unsigned char *b = (const unsigned char *)((ULONG_PTR)p & ~(ULONG_PTR)0xfff);
+    unsigned int h = 2166136261u, i;
+
+    *nz = 0;
+    for (i = 0; i < 0x1000; i++) { h = (h ^ b[i]) * 16777619u; *nz += b[i] != 0; }
+    return h;
+}
+
+static void rtcs_diag_where( const char *when )
+{
+    void *stashed = RtlGetCurrentPeb()->WerRegistrationData;
+    void *mine = (void *)arm64x_check_call;
+    unsigned int nz, fnv = rtcs_diag_page_fnv( &pResetToConsistentState, &nz );
+
+    ERR( "[rtcs-where] %s: static=%p value=%p code=%p check_call peb=%p this-copy=%p (%s) page-fnv=%08x page-nonzero-bytes=%u rev=rtcs-diag2\n",
+         when, (void *)&pResetToConsistentState, (void *)pResetToConsistentState, (void *)rtcs_diag_where,
+         stashed, mine, stashed == mine ? "same ntdll instance as init" : "DIFFERENT ntdll instance from init",
+         fnv, nz );
+}
+
 NTSTATUS arm64ec_process_init_dispatchers( HMODULE module )
 {
     CHPEV2_PROCESS_INFO *info = (CHPEV2_PROCESS_INFO *)(RtlGetCurrentPeb() + 1);
@@ -794,6 +851,20 @@ NTSTATUS arm64ec_process_init_dispatchers( HMODULE module )
     GET_PTR( ThreadTerm );
     GET_PTR( UpdateProcessorInformation );
 #undef GET_PTR
+
+    if (rtcs_diag_enabled())
+    {
+        const unsigned char *b = rtcs_diag_raw = RtlFindExportedRoutineByName( module, "ResetToConsistentState" );
+
+        rtcs_diag_init = (void *)pResetToConsistentState;
+        ERR( "[rtcs-ptr] init: module=%p redirect-entries=%u ResetToConsistentState export=%p pointer=%p "
+             "bytes=%02x%02x%02x%02x%02x%02x%02x%02x | ProcessInit=%p ThreadInit=%p BeginSimulation=%p "
+             "NotifyMemoryAlloc=%p rev=rtcs-diag\n",
+             module, (unsigned int)metadata->RedirectionMetadataCount, rtcs_diag_raw, (void *)pResetToConsistentState,
+             b ? b[0] : 0, b ? b[1] : 0, b ? b[2] : 0, b ? b[3] : 0, b ? b[4] : 0, b ? b[5] : 0, b ? b[6] : 0, b ? b[7] : 0,
+             (void *)pProcessInit, (void *)pThreadInit, (void *)pBeginSimulation, (void *)pNotifyMemoryAlloc );
+        rtcs_diag_where( "init" );
+    }
 
     RtlGetCurrentPeb()->ChpeV2ProcessInfo = info;
     info->NativeMachineType = IMAGE_FILE_MACHINE_ARM64;
@@ -3611,6 +3682,18 @@ static void * __attribute__((used)) prepare_exception_arm64ec( EXCEPTION_RECORD 
 {
     if (rec->ExceptionCode == STATUS_EMULATION_SYSCALL) dispatch_syscall( arm_ctx );
     context_arm_to_x64( context, arm_ctx );
+    /* rtcs-diag: the first 6 non-syscall exceptions whose hook pointer is NULL or differs from the value stored at init. */
+    if (rtcs_diag_enabled() && (!pResetToConsistentState || (void *)pResetToConsistentState != rtcs_diag_init) &&
+        rec->ExceptionCode != STATUS_EMULATION_SYSCALL && rtcs_diag_hits < 6 && InterlockedIncrement( &rtcs_diag_hits ) <= 6)
+    {
+        ERR( "[rtcs-ptr] exception #%d: code=%08x pc=%p pointer=%p stored-at-init=%p export=%p %s rev=rtcs-diag\n",
+             (int)rtcs_diag_hits, (unsigned int)rec->ExceptionCode, (void *)(ULONG_PTR)arm_ctx->Pc,
+             (void *)pResetToConsistentState, rtcs_diag_init, rtcs_diag_raw,
+             !pResetToConsistentState ? (rtcs_diag_init ? "NULL NOW, was set at init (cleared later)"
+                                                        : "NULL here (all three statics 0: page cleared or another ntdll instance)")
+                                      : "CHANGED since init" );
+        rtcs_diag_where( "exception" );
+    }
     /* iOS-Madeira task#34 probe: FEX's LogMan output is invisible on iOS (its
      * write(2) resolves to the PE CRT's WriteFile → unplumbed std handle),
      * so trace the guest-exception conversion from the wine side. Rate-
