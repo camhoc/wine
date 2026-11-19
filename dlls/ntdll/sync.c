@@ -650,8 +650,8 @@ NTSTATUS WINAPI RtlpWaitForCriticalSection( RTL_CRITICAL_SECTION *crit )
  */
 NTSTATUS WINAPI RtlpUnWaitCriticalSection( RTL_CRITICAL_SECTION *crit )
 {
-    NTSTATUS ret;
     HANDLE sem = get_semaphore( crit );
+    NTSTATUS ret = STATUS_SUCCESS;
 
     if (sem) ret = NtReleaseSemaphore( sem, 1, NULL );
     else
@@ -659,34 +659,29 @@ NTSTATUS WINAPI RtlpUnWaitCriticalSection( RTL_CRITICAL_SECTION *crit )
         LONG *lock = (LONG *)&crit->LockSemaphore;
         InterlockedExchange( lock, 1 );
         RtlWakeAddressSingle( lock );
-        ret = STATUS_SUCCESS;
     }
-    /* iOS-Madeira ml671: [cs-raise] — Book of the Dead dies on an UNHANDLED
-     * c0000008 with flags=1 (EXCEPTION_NONCONTINUABLE). That flag is the
-     * discriminator: RtlRaiseStatus sets it, KiRaiseUserExceptionDispatcher
-     * does not -- which is why the ml669 [bad-close] probe on the NtClose path
-     * never fired. This is one of only two RtlRaiseStatus sites in sync.c, and
-     * thread 0114 was parked on a semaphore when it died.
+    /* iOS-Madeira ml671: [cs-raise] — Book of the Dead died on an UNHANDLED
+     * c0000008 with flags=1 (EXCEPTION_NONCONTINUABLE) raised from here when
+     * NtReleaseSemaphore failed: the section's backing semaphore was closed
+     * underneath a live critical section, a handle-lifetime bug.
      *
-     * If NtReleaseSemaphore returns STATUS_INVALID_HANDLE here, the section's
-     * backing semaphore was closed underneath a live critical section -- a
-     * handle-lifetime bug, and a general one. Log the section's full state
-     * before RtlRaiseException overwrites the exception address with its own.
-     * Deliberately does not suppress: converting this to a silent return would
-     * leave the lock permanently broken instead of loudly dead. */
+     * Wine 11.22 (06c0cb5c5 "ntdll: Ignore semaphore errors in
+     * RtlpUnWaitCriticalSection()") no longer raises, which is what Windows
+     * does. The log stays so the lifetime bug is still visible. */
     if (ret)
     {
         static LONG cs_raise_n;
         if (InterlockedIncrement( &cs_raise_n ) <= 16)
+        {
             ios_cs_report_bad( crit, "UnWait" );
-            ERR( "[cs-raise] ml671 UnWait status=%08x crit=%p sem=%p owner=%04lx "
+            ERR( "[cs-raise] ml671 UnWait status=%08x (ignored, as upstream) crit=%p sem=%p owner=%04lx "
                  "lock=%ld recursion=%ld caller=%p\n",
                  (unsigned int)ret, crit, crit->LockSemaphore,
                  HandleToULong(crit->OwningThread), (long)crit->LockCount,
                  (long)crit->RecursionCount, __builtin_return_address(0) );
+        }
     }
-    if (ret) RtlRaiseStatus( ret );
-    return ret;
+    return STATUS_SUCCESS;
 }
 
 
@@ -2130,7 +2125,7 @@ BOOLEAN WINAPI RtlBarrier( RTL_BARRIER *barrier, ULONG flags )
 
     /* Wait for previous wait iteration to complete. */
     count = 0;
-    while (ReadAcquire( &b->reached_thread_count ) == b->total_thread_count)
+    while (ReadAcquire( &b->reached_thread_count ) >= b->total_thread_count)
     {
         if (count < spin_count)
         {
@@ -2142,7 +2137,7 @@ BOOLEAN WINAPI RtlBarrier( RTL_BARRIER *barrier, ULONG flags )
                           sizeof(b->reached_thread_count), NULL );
     }
     InterlockedIncrement( &b->waiting_thread_count );
-    if (InterlockedIncrement( &b->reached_thread_count ) == b->total_thread_count)
+    if (InterlockedIncrement( &b->reached_thread_count ) >= b->total_thread_count)
     {
         WriteRelease( &b->wait_barrier_complete, 1 );
         RtlWakeAddressAll( (const void *)&b->wait_barrier_complete );
